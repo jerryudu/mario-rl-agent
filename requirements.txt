@@ -1,0 +1,7 @@
+torch
+torchvision
+stable-baselines3[extra]
+gym-super-mario-bros
+nes-py
+opencv-python
+numpy
