@@ -1,0 +1,300 @@
+from typing import Any, Optional, Union
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import warnings
+from gymnasium import spaces
+from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.utils import FloatSchedule, explained_variance
+class VisionBackboneExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Box):
+        super().__init__(observation_space, features_dim=512)
+        
+        n_input_channels = observation_space.shape[0]
+        
+        # --- 優化：使用 Nature CNN 架構 (專為 84x84 遊戲設計) ---
+        # 結構簡單，參數少，訓練速度會比 ResNet 快很多
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # 計算 CNN 輸出維度 (對於 84x84 輸入，這通常是 3136)
+        with torch.no_grad():
+            sample_input = torch.as_tensor(observation_space.sample()[None]).float()
+            n_flatten = self.cnn(sample_input).shape[1]
+
+        self.linear = nn.Sequential(
+            nn.Linear(n_flatten, 512),
+            nn.ReLU()
+        )
+        self._features_dim = 512
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.cnn(observations))
+
+
+class VisionScalarExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Dict):
+        assert isinstance(observation_space, spaces.Dict), "VisionScalarExtractor expects a Dict observation space"
+        image_space = observation_space["image"]
+        scalar_space = observation_space["scalars"]
+        super().__init__(observation_space, features_dim=1)
+        self.image_extractor = VisionBackboneExtractor(image_space)
+        scalar_dim = int(np.prod(scalar_space.shape))
+        ######################################
+        # Define a simple MLP for scalar data
+        ######################################
+        self.scalar_net = nn.Sequential(
+            nn.Linear(scalar_dim, 64),  # Input: 2D scalars (step_feat, time_feat) -> 64D hidden
+            nn.ReLU(),
+            nn.Linear(64, 64),  # Optional additional layer for better feature mixing
+        )
+        ######################################
+        ######################################
+        self._features_dim = self.image_extractor.features_dim + 64
+
+        # --- 優化：權重初始化 ---
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            # Gain=np.sqrt(2) 是針對 ReLU 的最佳設定
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+
+    def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
+        image_feats = self.image_extractor(observations["image"])
+        scalar_feats = self.scalar_net(observations["scalars"])
+        return torch.cat([image_feats, scalar_feats], dim=1)
+
+
+class VisionBackbonePolicy(ActorCriticPolicy):
+    def __init__(self, *args: Any, **kwargs: Any):
+        kwargs["features_extractor_class"] = VisionScalarExtractor
+        super().__init__(*args, **kwargs)
+        
+class CustomPPO(OnPolicyAlgorithm):
+    def __init__(
+        self,
+        policy: Union[str, type[ActorCriticPolicy]],
+        env: Union[GymEnv, str],
+        learning_rate: Union[float, Schedule] = 3e-4,
+        n_steps: int = 2048,
+        batch_size: int = 64,
+        n_epochs: int = 10,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_range: Union[float, Schedule] = 0.2,
+        normalize_advantage: bool = True,
+        ent_coef: float = 0.01,
+        vf_coef: float = 0.5,
+        kl_coef: float = 0.0,
+        max_grad_norm: float = 0.5,
+        use_sde: bool = False,
+        sde_sample_freq: int = -1,
+        rollout_buffer_class: Optional[type[RolloutBuffer]] = None,
+        rollout_buffer_kwargs: Optional[dict[str, Any]] = None,
+        stats_window_size: int = 100,
+        tensorboard_log: Optional[str] = None,
+        policy_kwargs: Optional[dict[str, Any]] = None,
+        verbose: int = 0,
+        seed: Optional[int] = None,
+        device: Union[torch.device, str] = "cuda:0",
+        _init_setup_model: bool = True,
+    ):
+        super().__init__(
+            policy,
+            env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
+            use_sde=use_sde,
+            sde_sample_freq=sde_sample_freq,
+            rollout_buffer_class=rollout_buffer_class,
+            rollout_buffer_kwargs=rollout_buffer_kwargs,
+            stats_window_size=stats_window_size,
+            tensorboard_log=tensorboard_log,
+            policy_kwargs=policy_kwargs,
+            verbose=verbose,
+            device=device,
+            seed=seed,
+            _init_setup_model=_init_setup_model,
+            supported_action_spaces=(
+                spaces.Box,
+                spaces.Discrete,
+                spaces.MultiDiscrete,
+                spaces.MultiBinary,
+            ),
+        )
+        if normalize_advantage:
+            assert batch_size > 1, "Cannot normalize advantage with batch_size=1"
+        if self.env is not None:
+            # Check that `n_steps * n_envs > 1` to avoid NaN
+            # when doing advantage normalization
+            buffer_size = self.env.num_envs * self.n_steps
+            assert buffer_size > 1 or (
+                not normalize_advantage
+            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+            # Check that the rollout buffer size is a multiple of the mini-batch size
+            untruncated_batches = buffer_size // batch_size
+            if buffer_size % batch_size > 0:
+                warnings.warn(
+                    f"You have specified a mini-batch size of {batch_size},"
+                    f" but because the `RolloutBuffer` is of size `n_steps * n_envs = {buffer_size}`,"
+                    f" after every {untruncated_batches} untruncated mini-batches,"
+                    f" there will be a truncated mini-batch of size {buffer_size % batch_size}\n"
+                    f"We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.\n"
+                    f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})"
+                )
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.clip_range = clip_range
+        self.normalize_advantage = normalize_advantage
+        self.kl_coef = kl_coef
+    def train(self):
+        ##################################
+        # Every RolloutBuffer sample contains:
+        # class RolloutBufferSamples(NamedTuple):
+        #   observations: th.Tensor
+        #   actions: th.Tensor
+        #   old_values: th.Tensor
+        #   old_log_prob: th.Tensor
+        #   advantages: th.Tensor
+        #   returns: th.Tensor
+        ###################################
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
+        continue_training = True
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    actions = rollout_data.actions.long().flatten()
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+                # Normalize advantage
+                advantages = rollout_data.advantages
+                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    
+                # ratio between old and new policy, should be one at the first iteration
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                # clipped surrogate loss
+                ##############################
+                # YOUR CODE HERE
+                ##############################
+                # hints: use torch.clamp, torch.min, and negative sign for gradient ascent
+                policy_loss = -torch.min(ratio * advantages, torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantages).mean()
+                ##############################
+                ##############################
+                # Logging
+                pg_losses.append(policy_loss.item())
+                clip_fraction = torch.mean((torch.abs(ratio - 1) > self.clip_range).float()).item()
+                clip_fractions.append(clip_fraction)
+                values_pred = values
+                
+                # Value loss using the TD(gae_lambda) target
+                # --- 優化 3: Value Function Clipping (已修改) ---
+                # 1. 計算限制變動後的 Value (Clipping)
+                values_clipped = rollout_data.old_values + torch.clamp(
+                    values_pred - rollout_data.old_values,
+                    -self.clip_range,
+                    self.clip_range
+                )
+                
+                # 2. 計算原始 Loss 和 Clipped Loss
+                loss_v1 = (values_pred - rollout_data.returns) ** 2
+                loss_v2 = (values_clipped - rollout_data.returns) ** 2
+                
+                # 3. 取兩者較大值 (保守策略)，並乘上 0.5 (MSE 常數)
+                value_loss = 0.5 * torch.max(loss_v1, loss_v2).mean()
+                # --------------------------------------------------
+
+                value_losses.append(value_loss.item())
+                
+                # Entropy loss favor exploration
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
+                entropy_losses.append(entropy_loss.item())
+                
+                ################################
+                # YOUR CODE HERE
+                # Compute KL divergence between old and new policy
+                # Adding all losses together
+                ################################
+                kl_div = (rollout_data.old_log_prob - log_prob).mean()  # Approximate KL: old_log_prob - new_log_prob
+                approx_kl_divs.append(kl_div.item())
+                if self.kl_coef == 0:
+                    loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                else:
+                    loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + self.kl_coef * kl_div
+                ################################
+                ################################
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                # Clip grad norm
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+
+            self._n_updates += 1
+            if not continue_training:
+                break
+        explained_variance_ = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+        # Logs
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_variance_)
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", torch.exp(self.policy.log_std).mean().item())
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", self.clip_range)
+
+        
+    def learn(
+        self,
+        total_timesteps: int,
+        callback: MaybeCallback = None,
+        log_interval: int = 1,
+        tb_log_name: str = "MyPPO",
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = True,
+    ):
+        return super().learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            log_interval=log_interval,
+            tb_log_name=tb_log_name,
+            reset_num_timesteps=reset_num_timesteps,
+            progress_bar=progress_bar,
+        )

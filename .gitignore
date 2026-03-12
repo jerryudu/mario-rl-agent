@@ -1,0 +1,18 @@
+cat << 'EOF' > .gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+
+# 強化學習與影片
+runs/
+checkpoints/
+*.pth
+*.zip
+*.mp4
+# 備註：我們允許 .gif 上傳，但擋掉 .mp4
+EOF
